@@ -13,3 +13,20 @@ This repository contains the application source code for the DevOps Voting GitOp
 ## Purpose
 
 This project demonstrates a simple microservices architecture that will later be containerized with Docker, deployed to Kubernetes, and managed with GitOps.
+
+## Local Docker Runtime
+
+The application can be run locally with Docker Compose.
+
+Runtime services:
+
+- vote: voting web UI
+- redis: message queue
+- worker: background processor
+- db: PostgreSQL database
+- result: results web UI
+
+Runtime flow:
+
+```text
+Browser -> vote -> Redis -> worker -> PostgreSQL -> result -> Browser
