@@ -1,0 +1,74 @@
+name: devops-voting-local
+
+services:
+  vote:
+    build:
+      context: ./vote
+      target: final
+    image: devops-voting/vote:local
+    ports:
+      - "8080:80"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - front-tier
+      - back-tier
+
+  result:
+    build:
+      context: ./result
+    image: devops-voting/result:local
+    ports:
+      - "8081:80"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - front-tier
+      - back-tier
+
+  worker:
+    build:
+      context: ./worker
+    image: devops-voting/worker:local
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    networks:
+      - back-tier
+
+  redis:
+    image: redis:alpine
+    networks:
+      - back-tier
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - back-tier
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  db-data:
+
+networks:
+  front-tier:
+  back-tier:
