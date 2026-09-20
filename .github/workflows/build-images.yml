@@ -1,4 +1,4 @@
-name: Build Docker images
+name: Build Images and Update GitOps
 
 on:
   push:
@@ -10,10 +10,17 @@ permissions:
   contents: read
   packages: write
 
+env:
+  REGISTRY: ghcr.io
+  INFRA_REPOSITORY: nugusu20/microservices-infra-gitops
+
 jobs:
   build-images:
+    name: Build ${{ matrix.service }}
     runs-on: ubuntu-latest
+
     strategy:
+      fail-fast: false
       matrix:
         service:
           - vote
@@ -21,7 +28,7 @@ jobs:
           - worker
 
     steps:
-      - name: Check out repository
+      - name: Check out application repository
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
@@ -31,11 +38,11 @@ jobs:
         if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and optionally push ${{ matrix.service }}
+      - name: Build and optionally push image
         uses: docker/build-push-action@v6
         with:
           context: ./${{ matrix.service }}
@@ -43,3 +50,168 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:${{ github.sha }}
             ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:latest
+
+  update-gitops:
+    name: Update GitOps repository
+    runs-on: ubuntu-latest
+    needs: build-images
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Check out infrastructure repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.INFRA_REPOSITORY }}
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          ref: main
+          path: infra
+          fetch-depth: 0
+
+      - name: Update application image tags
+        working-directory: infra
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path("helm/voting-app/values.yaml")
+          image_tag = os.environ["IMAGE_TAG"]
+
+          services = {"vote", "result", "worker"}
+          updated = set()
+
+          lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+          current_section = None
+
+          for index, line in enumerate(lines):
+              stripped = line.strip()
+
+              if line and not line[0].isspace() and stripped.endswith(":"):
+                  current_section = stripped[:-1]
+
+              if current_section in services and line.startswith("  tag:"):
+                  newline = "\n" if line.endswith("\n") else ""
+                  lines[index] = f"  tag: {image_tag}{newline}"
+                  updated.add(current_section)
+
+          missing = services - updated
+
+          if missing:
+              raise SystemExit(
+                  f"Failed to update tags for: {', '.join(sorted(missing))}"
+              )
+
+          path.write_text("".join(lines), encoding="utf-8")
+
+          print(f"Updated tag: {image_tag}")
+          print(f"Updated services: {', '.join(sorted(updated))}")
+          PY
+
+      - name: Verify image tags
+        working-directory: infra
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          COUNT="$(grep -c "tag: ${IMAGE_TAG}" helm/voting-app/values.yaml)"
+
+          echo "Expected image tag: ${IMAGE_TAG}"
+          echo "Application tags found: ${COUNT}"
+
+          if [ "${COUNT}" -ne 3 ]; then
+            echo "Expected exactly 3 application image tags."
+            exit 1
+          fi
+
+      - name: Create deployment branch
+        id: git
+        working-directory: infra
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${IMAGE_TAG::7}"
+          BRANCH="automation/deploy-${SHORT_SHA}"
+
+          echo "branch=${BRANCH}" >> "${GITHUB_OUTPUT}"
+
+          if git diff --quiet; then
+            echo "No infrastructure changes required."
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git switch -C "${BRANCH}"
+
+          git add helm/voting-app/values.yaml
+          git commit -m "chore(images): deploy application ${SHORT_SHA}"
+
+          git push \
+            --force-with-lease \
+            --set-upstream origin \
+            "${BRANCH}"
+
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Create pull request
+        if: steps.git.outputs.changed == 'true'
+        working-directory: infra
+        env:
+          GH_TOKEN: ${{ secrets.INFRA_REPO_TOKEN }}
+          BRANCH: ${{ steps.git.outputs.branch }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          PR_URL="$(gh pr list \
+            --repo "${INFRA_REPOSITORY}" \
+            --head "${BRANCH}" \
+            --base main \
+            --state open \
+            --json url \
+            --jq '.[0].url')"
+
+          if [ -z "${PR_URL}" ]; then
+            PR_URL="$(gh pr create \
+              --repo "${INFRA_REPOSITORY}" \
+              --base main \
+              --head "${BRANCH}" \
+              --title "chore(images): deploy ${IMAGE_TAG::7}" \
+              --body "Automated GitOps update.
+
+          Application commit:
+          \`${IMAGE_TAG}\`
+
+          Updated images:
+          - vote
+          - result
+          - worker
+
+          Infrastructure CI must pass before merge.")"
+          fi
+
+          echo "Pull request: ${PR_URL}"
+
+      - name: Enable automatic merge
+        if: steps.git.outputs.changed == 'true'
+        working-directory: infra
+        env:
+          GH_TOKEN: ${{ secrets.INFRA_REPO_TOKEN }}
+          BRANCH: ${{ steps.git.outputs.branch }}
+        run: |
+          PR_URL="$(gh pr list \
+            --repo "${INFRA_REPOSITORY}" \
+            --head "${BRANCH}" \
+            --base main \
+            --state open \
+            --json url \
+            --jq '.[0].url')"
+
+          gh pr merge \
+            "${PR_URL}" \
+            --repo "${INFRA_REPOSITORY}" \
+            --auto \
+            --squash
